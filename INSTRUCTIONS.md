@@ -6,7 +6,15 @@
 
 ## Порядок работы
 
-1. Установи зависимости: `pip install -q -r requirements.txt`.
+1. Установи зависимости именно для того Python, которым запускаются скрипты:
+   ```
+   python3 -m pip install -q --ignore-installed -r requirements.txt \
+     || python3 -m pip install -q --ignore-installed --break-system-packages -r requirements.txt
+   python3 -c "import PIL.Image; print('Pillow', PIL.__version__)"
+   ```
+   В системе может стоять сломанный Pillow из пакетов Ubuntu, поэтому нужен
+   `--ignore-installed`. Если проверка импорта всё равно падает, продолжай без
+   картинки (см. шаг 7).
 2. Получи факты о небе: `python3 scripts/sky.py`.
    Скрипт пишет `out/sky.txt` (читаешь ты) и `out/sky.json` (читает card.py).
    Если код выхода не 0, переходи к шагу «Сбой».
@@ -29,6 +37,9 @@
    и добавь `--footer "$CHANNEL_FOOTER"`, если переменная `CHANNEL_FOOTER`
    не пустая. Заголовок до 22 символов (например, «Луна в Тельце»),
    подзаголовок до 60 символов (главное событие с временем).
+   **Если карточка не нарисовалась**, пост всё равно публикуется, только без
+   картинки: в шагах 8 и 9 не передавай `--image`, а после отправки выполни
+   `python3 scripts/send.py notify "Астропогода: пост вышел без картинки. <причина>"`.
 8. Пробная отправка:
    `python3 scripts/send.py post --text out/post.md --image out/card.png --dry-run`.
    Если длина больше 1024 символов, сократи пост и повтори пробу.

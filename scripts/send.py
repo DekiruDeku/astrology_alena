@@ -113,11 +113,14 @@ def _encode_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def send_post(text_path: Path, image_path: Path, dry_run: bool) -> None:
+def send_post(text_path: Path, image_path: Path | None, dry_run: bool) -> None:
     post_html = markdown_to_telegram_html(text_path.read_text(encoding="utf-8"))
     length = visible_length(post_html)
     if length > MESSAGE_LIMIT:
         raise TelegramError(f"Пост длиннее {MESSAGE_LIMIT} символов ({length})")
+    if image_path is None:
+        send_text_only(post_html, length, dry_run)
+        return
     if not image_path.is_file():
         raise FileNotFoundError(f"Нет картинки {image_path}")
 
@@ -145,6 +148,23 @@ def send_post(text_path: Path, image_path: Path, dry_run: bool) -> None:
     print("Пост отправлен в канал.")
 
 
+def send_text_only(post_html: str, length: int, dry_run: bool) -> None:
+    print(f"Длина поста: {length} символов. Отправка: только текст, без картинки.")
+    if dry_run:
+        print("Пробный запуск, в Telegram ничего не отправлено.")
+        print(post_html)
+        return
+    token = require_env("TELEGRAM_BOT_TOKEN")
+    channel = require_env("TELEGRAM_CHANNEL_ID")
+    call_api(token, "sendMessage", {
+        "chat_id": channel,
+        "text": post_html,
+        "parse_mode": "HTML",
+        "link_preview_options": json.dumps({"is_disabled": True}),
+    })
+    print("Пост отправлен в канал (без картинки).")
+
+
 def notify_admin(message: str) -> None:
     admin_chat = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
     if not admin_chat:
@@ -161,7 +181,7 @@ def parse_args() -> argparse.Namespace:
 
     post = commands.add_parser("post", help="отправить пост в канал")
     post.add_argument("--text", type=Path, required=True)
-    post.add_argument("--image", type=Path, required=True)
+    post.add_argument("--image", type=Path, default=None, help="без него уйдёт только текст")
     post.add_argument("--dry-run", action="store_true")
 
     notify = commands.add_parser("notify", help="написать администратору")
