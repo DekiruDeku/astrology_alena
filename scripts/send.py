@@ -35,6 +35,7 @@ CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 REQUEST_TIMEOUT_SECONDS = 60
 BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+BULLET = "•"
 
 
 class TelegramError(RuntimeError):
@@ -46,8 +47,22 @@ class ConfigError(RuntimeError):
 
 
 def markdown_to_telegram_html(text: str) -> str:
-    escaped = html.escape(text.strip(), quote=False)
+    escaped = html.escape(separate_lists(text.strip()), quote=False)
     return BOLD_PATTERN.sub(r"<b>\1</b>", escaped)
+
+
+def separate_lists(text: str) -> str:
+    """Ставит пустую строку перед списком «•» и после него."""
+    lines = text.splitlines()
+    result: list[str] = []
+    for line in lines:
+        is_item = line.lstrip().startswith(BULLET)
+        previous = result[-1] if result else ""
+        previous_is_item = previous.lstrip().startswith(BULLET)
+        if previous.strip() and is_item != previous_is_item:
+            result.append("")
+        result.append(line)
+    return "\n".join(result)
 
 
 def visible_length(telegram_html: str) -> int:
