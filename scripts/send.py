@@ -36,6 +36,7 @@ MESSAGE_LIMIT = 4096
 REQUEST_TIMEOUT_SECONDS = 60
 BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 BULLET = "•"
+POST_SIGNATURE = "@tarologapp_bot"
 
 
 class TelegramError(RuntimeError):
@@ -47,8 +48,24 @@ class ConfigError(RuntimeError):
 
 
 def markdown_to_telegram_html(text: str) -> str:
-    escaped = html.escape(separate_lists(text.strip()), quote=False)
+    prepared = add_signature(collapse_blank_lines(separate_lists(text.strip())))
+    escaped = html.escape(prepared, quote=False)
     return BOLD_PATTERN.sub(r"<b>\1</b>", escaped)
+
+
+def collapse_blank_lines(text: str) -> str:
+    """Не больше одной пустой строки подряд."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def add_signature(text: str) -> str:
+    """Добавляет подпись последней строкой, если её ещё нет."""
+    lines = text.rstrip().splitlines()
+    while lines and lines[-1].strip() == POST_SIGNATURE:
+        lines.pop()
+    body = "\n".join(lines).rstrip()
+    return f"{body}\n\n{POST_SIGNATURE}"
 
 
 def separate_lists(text: str) -> str:

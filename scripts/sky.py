@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Собирает факты о небе на один день по эфемеридам NASA JPL Horizons.
 
-Все позиции геоцентрические (видимые эклиптические долготы). Время в отчёте
+Все позиции геоцентрические (видимые эклиптические координаты). Время в отчёте
 московское (UTC+3). Скрипт ничего не толкует: только знаки, градусы, фазы
-Луны, смены знаков, развороты планет и точные аспекты.
+Луны, затмения, смены знаков, развороты планет и точные аспекты.
+
+Отчёт делится на «сегодня» и «не для поста» (прошлое и будущее за пределами
+дня), чтобы в пост попадало только то, что происходит сегодня.
 
 Запуск:
     python scripts/sky.py                  # сегодня по Москве
@@ -28,7 +31,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
-USER_AGENT = "astro-channel-sky/1.0"
+USER_AGENT = "astro-channel-sky/1.1"
 REQUEST_TIMEOUT_SECONDS = 40
 REQUEST_ATTEMPTS = 3
 
@@ -42,6 +45,11 @@ HOURLY_AFTER = timedelta(hours=72)
 STATION_WINDOW_DAYS = 15
 
 PLANET_ASPECT_ORB = 3.0
+
+EARTH_RADIUS_KM = 6378.14
+MOON_RADIUS_KM = 1737.4
+SUN_RADIUS_KM = 696000.0
+SUPERMOON_DISTANCE_KM = 362000.0
 
 
 @dataclass(frozen=True)
@@ -63,7 +71,6 @@ BODIES = (
     Body("neptune", "899", "Нептун"),
     Body("pluto", "999", "Плутон"),
 )
-BODY_BY_KEY = {body.key: body for body in BODIES}
 PLANETS_THAT_STATION = tuple(
     body for body in BODIES if body.key not in ("sun", "moon")
 )
@@ -82,6 +89,13 @@ SIGNS_INTO = (
     "в Весы", "в Скорпиона", "в Стрельца", "в Козерога", "в Водолея",
     "в Рыбы",
 )
+# Вход Солнца в эти знаки: равноденствия и солнцестояния.
+SEASON_POINTS = {
+    0: "день весеннего равноденствия",
+    3: "день летнего солнцестояния",
+    6: "день осеннего равноденствия",
+    9: "день зимнего солнцестояния",
+}
 
 ASPECTS = {
     0: "соединение",
@@ -117,6 +131,15 @@ RELATIVE_DAYS = {
     2: "послезавтра",
 }
 
+
+@dataclass(frozen=True)
+class EphemerisRow:
+    time: datetime
+    longitude: float
+    latitude: float
+    diameter_arcsec: float | None
+
+
 Series = list[tuple[datetime, float]]
 
 
@@ -129,10 +152,10 @@ class SkyDataError(RuntimeError):
 # --------------------------------------------------------------------------
 
 
-def fetch_longitudes(
+def fetch_rows(
     body: Body, start_utc: datetime, stop_utc: datetime, step: str
-) -> Series:
-    """Возвращает ряд (время UTC, эклиптическая долгота) для тела."""
+) -> list[EphemerisRow]:
+    """Долгота, широта и угловой диаметр тела с заданным шагом."""
     params = {
         "format": "json",
         "COMMAND": f"'{body.horizons_id}'",
@@ -140,7 +163,7 @@ def fetch_longitudes(
         "MAKE_EPHEM": "'YES'",
         "EPHEM_TYPE": "'OBSERVER'",
         "CENTER": "'500@399'",
-        "QUANTITIES": "'31'",
+        "QUANTITIES": "'13,31'",
         "ANG_FORMAT": "'DEG'",
         "CSV_FORMAT": "'YES'",
         "START_TIME": f"'{start_utc:%Y-%m-%d %H:%M}'",
@@ -149,10 +172,10 @@ def fetch_longitudes(
     }
     url = f"{HORIZONS_URL}?{urllib.parse.urlencode(params)}"
     payload = _get_json(url)
-    series = _parse_horizons_table(payload.get("result", ""))
-    if len(series) < 2:
+    rows = _parse_horizons_table(payload.get("result", ""))
+    if len(rows) < 2:
         raise SkyDataError(f"Horizons не вернул данных для тела «{body.name}»")
-    return series
+    return rows
 
 
 def _get_json(url: str) -> dict:
@@ -170,17 +193,44 @@ def _get_json(url: str) -> dict:
     raise SkyDataError(f"Не удалось получить эфемериды из Horizons: {last_error}")
 
 
-def _parse_horizons_table(text: str) -> Series:
+def _parse_horizons_table(text: str) -> list[EphemerisRow]:
     if "$$SOE" not in text or "$$EOE" not in text:
         raise SkyDataError("В ответе Horizons нет таблицы эфемерид")
-    table = text.split("$$SOE", 1)[1].split("$$EOE", 1)[0]
-    series: Series = []
-    for line in table.strip().splitlines():
+    header_part, rest = text.split("$$SOE", 1)
+    columns = _parse_header(header_part)
+    try:
+        lon_index = columns.index("ObsEcLon")
+        lat_index = columns.index("ObsEcLat")
+        diameter_index = columns.index("Ang-diam")
+    except ValueError as error:
+        raise SkyDataError(f"Неожиданные колонки Horizons: {columns}") from error
+
+    rows = []
+    for line in rest.split("$$EOE", 1)[0].strip().splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) < 4:
+        if len(fields) <= max(lon_index, lat_index, diameter_index):
             continue
-        series.append((_parse_horizons_time(fields[0]), float(fields[3])))
-    return series
+        rows.append(EphemerisRow(
+            time=_parse_horizons_time(fields[0]),
+            longitude=float(fields[lon_index]),
+            latitude=float(fields[lat_index]),
+            diameter_arcsec=_parse_optional_float(fields[diameter_index]),
+        ))
+    return rows
+
+
+def _parse_header(header_part: str) -> list[str]:
+    header_lines = [line for line in header_part.splitlines() if "Date__" in line]
+    if not header_lines:
+        raise SkyDataError("В ответе Horizons нет строки с названиями колонок")
+    return [name.strip() for name in header_lines[-1].split(",")]
+
+
+def _parse_optional_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _parse_horizons_time(value: str) -> datetime:
@@ -244,6 +294,19 @@ def value_at(series: Series, moment: datetime) -> float:
     return (lon1 + signed_diff(lon2, lon1) * fraction) % 360.0
 
 
+def linear_at(rows: list[EphemerisRow], moment: datetime, field: str) -> float:
+    """Линейная интерполяция широты или диаметра (без перехода через 360)."""
+    times = [row.time for row in rows]
+    index = bisect.bisect_right(times, moment) - 1
+    index = max(0, min(index, len(rows) - 2))
+    first, second = rows[index], rows[index + 1]
+    value_first, value_second = getattr(first, field), getattr(second, field)
+    if value_first is None or value_second is None:
+        raise SkyDataError(f"Нет значения {field} в данных Horizons")
+    fraction = (moment - first.time) / (second.time - first.time)
+    return value_first + (value_second - value_first) * fraction
+
+
 def sign_index(longitude: float) -> int:
     return int(longitude // 30) % 12
 
@@ -275,6 +338,10 @@ def describe_position(longitude: float) -> str:
     return f"{SIGNS[sign_index(longitude)]} {degree_in_sign(longitude)}°"
 
 
+def msk_date(moment: datetime) -> date:
+    return moment.astimezone(MSK).date()
+
+
 # --------------------------------------------------------------------------
 # Расчёт фактов
 # --------------------------------------------------------------------------
@@ -285,8 +352,12 @@ class SkyData:
     day: date
     day_start: datetime
     noon: datetime
+    rows: dict[str, list[EphemerisRow]]
     hourly: dict[str, Series]
     daily: dict[str, Series]
+
+    def is_today(self, moment: datetime) -> bool:
+        return msk_date(moment) == self.day
 
 
 def load_sky_data(day: date) -> SkyData:
@@ -294,18 +365,25 @@ def load_sky_data(day: date) -> SkyData:
         timezone.utc
     )
     noon = day_start + timedelta(hours=12)
-    hourly = {
-        body.key: fetch_longitudes(
+    rows = {
+        body.key: fetch_rows(
             body, day_start - HOURLY_BEFORE, day_start + HOURLY_AFTER, "1h"
         )
         for body in BODIES
     }
     window = timedelta(days=STATION_WINDOW_DAYS)
     daily = {
-        body.key: fetch_longitudes(body, noon - window, noon + window, "1d")
+        body.key: [
+            (row.time, row.longitude)
+            for row in fetch_rows(body, noon - window, noon + window, "1d")
+        ]
         for body in PLANETS_THAT_STATION
     }
-    return SkyData(day, day_start, noon, hourly, daily)
+    hourly = {
+        key: [(row.time, row.longitude) for row in body_rows]
+        for key, body_rows in rows.items()
+    }
+    return SkyData(day, day_start, noon, rows, hourly, daily)
 
 
 def collect_positions(sky: SkyData) -> list[dict]:
@@ -337,48 +415,42 @@ def collect_ingresses(sky: SkyData) -> list[dict]:
         times = [point[0] for point in series]
         values = unwrap([point[1] for point in series])
         for moment in find_crossings(times, values, 0.0, 30.0):
-            shift = abs((moment.astimezone(MSK).date() - sky.day).days)
+            shift = abs((msk_date(moment) - sky.day).days)
             if body.key != "moon" and shift > 2:
                 continue
-            after = value_at(series, moment + timedelta(minutes=30))
+            new_sign = sign_index(value_at(series, moment + timedelta(minutes=30)))
             ingresses.append({
                 "body": body.key,
                 "name": body.name,
                 "time": moment.isoformat(),
-                "sign": SIGNS[sign_index(after)],
+                "today": sky.is_today(moment),
+                "sign": SIGNS[new_sign],
+                "sign_index": new_sign,
                 "text": (
-                    f"{body.name} переходит {SIGNS_INTO[sign_index(after)]}: "
+                    f"{body.name} переходит {SIGNS_INTO[new_sign]}: "
                     f"{format_moment(moment, sky.day)}"
                 ),
             })
     return sorted(ingresses, key=lambda item: item["time"])
 
 
-def collect_moon_stay(sky: SkyData, ingresses: list[dict]) -> list[str]:
-    """Где Луна в течение суток и когда входит/выходит из знака."""
-    moon_moves = [
-        datetime.fromisoformat(item["time"])
-        for item in ingresses
-        if item["body"] == "moon"
+def describe_moon_today(sky: SkyData, ingresses: list[dict]) -> str:
+    """Где Луна в течение суток по Москве."""
+    moon_moves_today = [
+        item for item in ingresses if item["body"] == "moon" and item["today"]
     ]
-    day_end = sky.day_start + timedelta(days=1)
-    boundaries = [moment for moment in moon_moves if sky.day_start < moment < day_end]
-    checkpoints = [sky.day_start] + boundaries
-    lines = []
-    for checkpoint in checkpoints:
-        longitude = value_at(sky.hourly["moon"], checkpoint + timedelta(minutes=1))
-        entered = max(
-            (moment for moment in moon_moves if moment <= checkpoint + timedelta(minutes=1)),
-            default=None,
+    start_sign = sign_index(
+        value_at(sky.hourly["moon"], sky.day_start + timedelta(minutes=1))
+    )
+    if not moon_moves_today:
+        return f"Луна весь день {SIGNS_IN[start_sign]}"
+    parts = [f"Луна {SIGNS_IN[start_sign]}"]
+    for move in moon_moves_today:
+        local = datetime.fromisoformat(move["time"]).astimezone(MSK)
+        parts.append(
+            f"в {local:%H:%M} переходит {SIGNS_INTO[move['sign_index']]}"
         )
-        leaves = min(
-            (moment for moment in moon_moves if moment > checkpoint + timedelta(minutes=1)),
-            default=None,
-        )
-        since = f"с {format_moment(entered, sky.day)}" if entered else "вход раньше окна"
-        until = f"до {format_moment(leaves, sky.day)}" if leaves else "выход позже окна"
-        lines.append(f"Луна {SIGNS_IN[sign_index(longitude)]} ({since}; {until})")
-    return lines
+    return ", ".join(parts)
 
 
 def collect_moon_phase(sky: SkyData) -> dict:
@@ -413,7 +485,7 @@ def _phase_name(elongation: float) -> str:
 
 
 def collect_lunations(sky: SkyData) -> list[dict]:
-    """Новолуния, полнолуния и четверти в окне почасовых данных."""
+    """Новолуния, полнолуния и четверти, плюс затмения и суперлуния."""
     moon_series, sun_series = sky.hourly["moon"], sky.hourly["sun"]
     times = [point[0] for point in moon_series]
     elongations = unwrap([
@@ -426,16 +498,83 @@ def collect_lunations(sky: SkyData) -> list[dict]:
             if moment < sky.day_start - timedelta(hours=24):
                 continue
             moon_lon = value_at(moon_series, moment)
+            geometry = _lunation_geometry(sky, moment)
+            extras = []
+            if angle in (0, 180):
+                eclipse = _classify_eclipse(angle, geometry)
+                if eclipse:
+                    extras.append(eclipse)
+            if angle == 180 and geometry["moon_distance_km"] < SUPERMOON_DISTANCE_KM:
+                extras.append("суперлуние: Луна близко к Земле и выглядит крупнее")
+            text = (
+                f"{name.capitalize()}: {format_moment(moment, sky.day)}, "
+                f"Луна {SIGNS_IN[sign_index(moon_lon)]} {degree_in_sign(moon_lon)}°"
+            )
+            if extras:
+                details = "; ".join(extras)
+                text += f". {details[0].upper()}{details[1:]}"
             lunations.append({
                 "name": name,
                 "time": moment.isoformat(),
+                "today": sky.is_today(moment),
+                "major": angle in (0, 180),
                 "moon_position": describe_position(moon_lon),
-                "text": (
-                    f"{name.capitalize()}: {format_moment(moment, sky.day)}, "
-                    f"Луна {SIGNS_IN[sign_index(moon_lon)]} {degree_in_sign(moon_lon)}°"
-                ),
+                "extras": extras,
+                "moon_distance_km": round(geometry["moon_distance_km"]),
+                "moon_latitude": round(geometry["moon_latitude"], 3),
+                "text": text,
             })
     return sorted(lunations, key=lambda item: item["time"])
+
+
+def _lunation_geometry(sky: SkyData, moment: datetime) -> dict:
+    moon_rows, sun_rows = sky.rows["moon"], sky.rows["sun"]
+    moon_radius_deg = linear_at(moon_rows, moment, "diameter_arcsec") / 7200.0
+    sun_radius_deg = linear_at(sun_rows, moment, "diameter_arcsec") / 7200.0
+    moon_distance = MOON_RADIUS_KM / math.sin(math.radians(moon_radius_deg))
+    sun_distance = SUN_RADIUS_KM / math.sin(math.radians(sun_radius_deg))
+    return {
+        "moon_latitude": linear_at(moon_rows, moment, "latitude"),
+        "sun_latitude": linear_at(sun_rows, moment, "latitude"),
+        "moon_radius": moon_radius_deg,
+        "sun_radius": sun_radius_deg,
+        "moon_parallax": math.degrees(math.asin(EARTH_RADIUS_KM / moon_distance)),
+        "sun_parallax": math.degrees(math.asin(EARTH_RADIUS_KM / sun_distance)),
+        "moon_distance_km": moon_distance,
+    }
+
+
+def _classify_eclipse(angle: int, geometry: dict) -> str | None:
+    """Затмение по широте Луны в момент новолуния или полнолуния.
+
+    Упрощённая геометрия (как у Меёса): тень Земли расширена на 2%,
+    видимость на конкретной территории не учитывается.
+    """
+    # Наклон пути Луны к эклиптике ~5°, минимальное расстояние чуть меньше.
+    moon_latitude = geometry["moon_latitude"] - (
+        geometry["sun_latitude"] if angle == 0 else -geometry["sun_latitude"]
+    )
+    distance = abs(moon_latitude) * math.cos(math.radians(5.15))
+    moon_r, sun_r = geometry["moon_radius"], geometry["sun_radius"]
+    moon_p, sun_p = geometry["moon_parallax"], geometry["sun_parallax"]
+
+    if angle == 0:
+        if distance > moon_p - sun_p + moon_r + sun_r:
+            return None
+        if distance < moon_p - sun_p:
+            kind = "полное" if moon_r > sun_r else "кольцеобразное"
+            return f"{kind} солнечное затмение (видно не везде)"
+        return "частное солнечное затмение (видно не везде)"
+
+    umbra = 1.02 * (moon_p + sun_p - sun_r)
+    penumbra = 1.02 * (moon_p + sun_p + sun_r)
+    if distance < umbra - moon_r:
+        return "полное лунное затмение, «кровавая Луна» (видно не везде)"
+    if distance < umbra + moon_r:
+        return "частное лунное затмение (видно не везде)"
+    if distance < penumbra + moon_r:
+        return "полутеневое лунное затмение, заметно слабо (видно не везде)"
+    return None
 
 
 def collect_stations(sky: SkyData) -> list[dict]:
@@ -456,11 +595,13 @@ def collect_stations(sky: SkyData) -> list[dict]:
             moment = t1 + (t2 - t1) * (m1 / (m1 - m2))
             longitude = value_at(series, moment)
             direct = m2 > 0
-            days_ago = (sky.day - moment.astimezone(MSK).date()).days
+            days_ago = (sky.day - msk_date(moment)).days
             stations.append({
                 "body": body.key,
                 "name": body.name,
                 "time": moment.isoformat(),
+                "today": days_ago == 0,
+                "days_ago": days_ago,
                 "direction": "директный" if direct else "ретроградный",
                 "position": describe_position(longitude),
                 "text": (
@@ -508,6 +649,7 @@ def _planet_aspect(sky: SkyData, first: Body, second: Body) -> dict | None:
         )
         applying = abs(later - aspect_angle) < orb
         exact = _exact_time(first_series, second_series, aspect_angle)
+        exact_today = exact is not None and sky.is_today(exact)
         sign_gap = (sign_index(lon_first) - sign_index(lon_second)) % 12
         sign_aspect = aspect_angle // 30
         same_signs_pattern = sign_gap in (sign_aspect, (12 - sign_aspect) % 12)
@@ -516,8 +658,8 @@ def _planet_aspect(sky: SkyData, first: Body, second: Body) -> dict | None:
             f"{second.name} ({describe_position(lon_second)}): {aspect_name}, "
             f"орбис {orb:.1f}°, {'сходящийся' if applying else 'расходящийся'}"
         )
-        if exact:
-            text += f", точный {format_moment(exact, sky.day)}"
+        if exact_today:
+            text += f", точный сегодня в {exact.astimezone(MSK):%H:%M}"
         if not same_signs_pattern:
             text += " (аспект через границу знаков)"
         return {
@@ -525,7 +667,7 @@ def _planet_aspect(sky: SkyData, first: Body, second: Body) -> dict | None:
             "aspect": aspect_name,
             "orb": round(orb, 2),
             "applying": applying,
-            "exact_time": exact.isoformat() if exact else None,
+            "exact_today": exact_today,
             "text": text,
         }
     return None
@@ -552,7 +694,6 @@ def collect_moon_aspects(sky: SkyData) -> list[dict]:
     """Точные аспекты Луны к планетам в течение суток по Москве."""
     moon_series = sky.hourly["moon"]
     times = [point[0] for point in moon_series]
-    day_end = sky.day_start + timedelta(days=1)
     events = []
     for body in BODIES:
         if body.key in ("moon", "sun"):
@@ -566,7 +707,7 @@ def collect_moon_aspects(sky: SkyData) -> list[dict]:
             targets = {float(aspect_angle), float((360 - aspect_angle) % 360)}
             for target in targets:
                 for moment in find_crossings(times, elongations, target, 360.0):
-                    if not sky.day_start <= moment < day_end:
+                    if not sky.is_today(moment):
                         continue
                     body_lon = value_at(body_series, moment)
                     events.append({
@@ -581,39 +722,79 @@ def collect_moon_aspects(sky: SkyData) -> list[dict]:
     return sorted(events, key=lambda item: item["time"])
 
 
+def collect_special_today(
+    lunations: list[dict], ingresses: list[dict], stations: list[dict]
+) -> list[str]:
+    """Особые события сегодняшнего дня, на которых строится пост."""
+    special = []
+    for item in lunations:
+        if item["today"] and (item["major"] or item["extras"]):
+            special.append(item["text"])
+    for item in ingresses:
+        if not item["today"] or item["body"] == "moon":
+            continue
+        if item["body"] == "sun" and item["sign_index"] in SEASON_POINTS:
+            special.append(
+                f"{SEASON_POINTS[item['sign_index']].capitalize()}: {item['text']}"
+            )
+        else:
+            special.append(item["text"])
+    for item in stations:
+        if item["today"]:
+            special.append(item["text"])
+    return special
+
+
 def build_report(day: date) -> dict:
     sky = load_sky_data(day)
     ingresses = collect_ingresses(sky)
+    lunations = collect_lunations(sky)
+    stations = collect_stations(sky)
     weekday = WEEKDAYS[day.weekday()]
     return {
         "date": day.isoformat(),
         "date_text": f"{day.day} {MONTHS_GENITIVE[day.month - 1]} {day.year}, {weekday}",
         "timezone": "Europe/Moscow (UTC+3)",
-        "source": "NASA JPL Horizons, геоцентрические видимые эклиптические долготы",
+        "source": "NASA JPL Horizons, геоцентрические видимые эклиптические координаты",
+        "special_today": collect_special_today(lunations, ingresses, stations),
+        "moon_today": describe_moon_today(sky, ingresses),
         "positions": collect_positions(sky),
-        "moon_stay": collect_moon_stay(sky, ingresses),
         "moon_phase": collect_moon_phase(sky),
-        "lunations": collect_lunations(sky),
+        "lunations": lunations,
         "ingresses": ingresses,
-        "stations": collect_stations(sky),
+        "stations": stations,
         "planet_aspects": collect_planet_aspects(sky),
         "moon_aspects": collect_moon_aspects(sky),
     }
 
 
+def _bullets(items: list[str]) -> list[str]:
+    return [f"- {item}" for item in items] or ["- нет"]
+
+
 def render_text(report: dict) -> str:
     phase = report["moon_phase"]
+    past_stations = [
+        item for item in report["stations"] if 0 < item["days_ago"] <= STATION_WINDOW_DAYS
+    ]
+    not_for_post = (
+        [item["text"] for item in report["lunations"] if not item["today"]]
+        + [item["text"] for item in report["ingresses"] if not item["today"]]
+        + [item["text"] for item in report["stations"] if item["days_ago"] < 0]
+    )
     lines = [
         f"НЕБО НА {report['date_text'].upper()}",
         f"Время московское. Источник: {report['source']}.",
         "",
-        "ЛУНА",
-        *[f"- {line}" for line in report["moon_stay"]],
+        "ОСОБОЕ СЕГОДНЯ (если есть, пост строится вокруг этого)",
+        *_bullets(report["special_today"]),
+        "",
+        "ЛУНА СЕГОДНЯ",
+        f"- {report['moon_today']}",
         f"- Фаза на 12:00: {phase['name']}, освещена на {phase['illumination_percent']}%",
-        *[f"- {item['text']}" for item in report["lunations"]],
         "",
         "ТОЧНЫЕ АСПЕКТЫ ЛУНЫ СЕГОДНЯ",
-        *([f"- {item['text']}" for item in report["moon_aspects"]] or ["- нет"]),
+        *_bullets([item["text"] for item in report["moon_aspects"]]),
         "",
         "ПОЛОЖЕНИЯ НА 12:00",
         *[
@@ -622,14 +803,14 @@ def render_text(report: dict) -> str:
             for item in report["positions"]
         ],
         "",
-        "СМЕНЫ ЗНАКОВ (Луна во всём окне, планеты ±2 дня)",
-        *([f"- {item['text']}" for item in report["ingresses"]] or ["- нет"]),
+        f"АСПЕКТЫ МЕЖДУ ПЛАНЕТАМИ СЕЙЧАС (орбис до {PLANET_ASPECT_ORB:.0f}°)",
+        *_bullets([item["text"] for item in report["planet_aspects"]]),
         "",
-        f"РАЗВОРОТЫ ПЛАНЕТ (±{STATION_WINDOW_DAYS} дней, точность около суток)",
-        *([f"- {item['text']}" for item in report["stations"]] or ["- нет"]),
+        "НЕДАВНИЕ РАЗВОРОТЫ (можно упомянуть как текущее состояние, без дат)",
+        *_bullets([item["text"] for item in past_stations]),
         "",
-        f"АСПЕКТЫ МЕЖДУ ПЛАНЕТАМИ (орбис до {PLANET_ASPECT_ORB:.0f}°)",
-        *([f"- {item['text']}" for item in report["planet_aspects"]] or ["- нет"]),
+        "НЕ ДЛЯ ПОСТА: прошлые и будущие события, только для понимания контекста",
+        *_bullets(not_for_post),
     ]
     return "\n".join(lines) + "\n"
 
