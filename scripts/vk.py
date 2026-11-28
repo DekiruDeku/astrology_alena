@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Публикует пост «Астропогода» на стене сообщества ВКонтакте.
+"""Публикует посты («Астропогода», гороскоп) на стене сообщества ВКонтакте.
 
 Переменные окружения:
     VK_GROUP_TOKEN  ключ доступа сообщества с правом на стену (обязателен)
     VK_GROUP_ID     (необязательно) числовой id сообщества без минуса;
                     если не задан, берётся из ключа сообщества
-    VK_BOT_LINK     (необязательно) ссылка на бота в конце поста,
-                    по умолчанию https://t.me/tarologapp_bot?start=vk
+    VK_BOT_LINK     (необязательно) ссылка в конце поста; по умолчанию ссылки нет
 
 Запуск:
     python scripts/vk.py check
     python scripts/vk.py post --text out/post.md --image out/card.png --dry-run
     python scripts/vk.py post --text out/post.md --image out/card.png
+    python scripts/vk.py post --text out/post.md --delay-minutes 60
+
+С --delay-minutes пост становится отложенной записью ВК и выходит позже.
+Если ВК отложенную запись не примет, пост публикуется сразу.
 
 Текст берётся тот же, что для Telegram: **жирный** убирается (ВК его не
-показывает), подпись @tarologapp_bot заменяется ссылкой на бота, потому что
-«@» во ВКонтакте означает упоминание страницы ВК.
+показывает), подпись @tarologapp_bot убирается, потому что «@» во ВКонтакте
+означает упоминание страницы ВК. Ссылка в конце ставится, только если задана
+VK_BOT_LINK.
 
 Картинку ключ сообщества загрузить на стену может и не суметь: ВК разрешает
 это только ключу пользователя. Тогда пост уходит без картинки, а скрипт
@@ -29,9 +33,11 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from send import (
@@ -45,10 +51,10 @@ from send import (
 
 API_URL = "https://api.vk.com/method/{method}"
 API_VERSION = "5.199"
-DEFAULT_BOT_LINK = "https://t.me/tarologapp_bot?start=vk"
 BOT_LINK_PREFIX = "Таро-бот:"
 MESSAGE_LIMIT = 16000
 REQUEST_TIMEOUT_SECONDS = 60
+MOSCOW_TZ = timezone(timedelta(hours=3))
 # Коды ошибок ВК «этому типу ключа метод недоступен» и «нет прав».
 FORBIDDEN_FOR_TOKEN_CODES = {5, 7, 15, 27, 1051}
 
@@ -83,14 +89,16 @@ def resolve_group(token: str) -> dict:
     return groups[0]
 
 
-def markdown_to_vk_text(text: str, bot_link: str) -> str:
-    """Текст поста для ВК: без **, с пустыми строками вокруг списков, ссылка на бота в конце."""
+def markdown_to_vk_text(text: str, bot_link: str = "") -> str:
+    """Текст поста для ВК: без ** и подписи @бота; ссылка в конце, только если задана."""
     prepared = collapse_blank_lines(separate_lists(text.strip()))
     plain = BOLD_PATTERN.sub(r"\1", prepared)
     lines = plain.rstrip().splitlines()
     while lines and lines[-1].strip() in {POST_SIGNATURE, ""}:
         lines.pop()
     body = "\n".join(lines).rstrip()
+    if not bot_link:
+        return body
     return f"{body}\n\n{BOT_LINK_PREFIX} {bot_link}"
 
 
@@ -168,12 +176,29 @@ def post_guid(message: str) -> str:
     return hashlib.sha256(message.encode("utf-8")).hexdigest()[:32]
 
 
-def send_post(text_path: Path, image_path: Path | None, dry_run: bool) -> None:
-    bot_link = os.environ.get("VK_BOT_LINK", "").strip() or DEFAULT_BOT_LINK
+def moscow_time(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, MOSCOW_TZ).strftime("%H:%M")
+
+
+def publish_wall_post(token: str, params: dict, publish_date: int | None) -> tuple[dict, int | None]:
+    """Публикует пост. Если ВК не принял отложенную публикацию, публикует сразу."""
+    if publish_date is None:
+        return call_api(token, "wall.post", params), None
+    try:
+        return call_api(token, "wall.post", {**params, "publish_date": publish_date}), publish_date
+    except VkError as error:
+        print(f"Отложить пост не получилось, публикую сразу. Ответ ВК: {error}")
+        return call_api(token, "wall.post", params), None
+
+
+def send_post(text_path: Path, image_path: Path | None, delay_minutes: int, dry_run: bool) -> None:
+    bot_link = os.environ.get("VK_BOT_LINK", "").strip()
     message = markdown_to_vk_text(text_path.read_text(encoding="utf-8"), bot_link)
     if len(message) > MESSAGE_LIMIT:
         raise VkError(f"Пост длиннее {MESSAGE_LIMIT} символов ({len(message)})")
-    print(f"Длина поста для ВК: {len(message)} символов.")
+    publish_date = int(time.time()) + delay_minutes * 60 if delay_minutes > 0 else None
+    when = f"в {moscow_time(publish_date)} МСК" if publish_date else "сразу"
+    print(f"Длина поста для ВК: {len(message)} символов. Публикация: {when}.")
     if dry_run:
         picture = f"с картинкой {image_path}" if image_path else "без картинки"
         print(f"Пробный запуск, во ВКонтакте ничего не опубликовано. Попытка: {picture}.")
@@ -191,10 +216,13 @@ def send_post(text_path: Path, image_path: Path | None, dry_run: bool) -> None:
     }
     if attachment:
         params["attachments"] = attachment
-    result = call_api(token, "wall.post", params)
+    result, scheduled_at = publish_wall_post(token, params, publish_date)
     link = f"https://vk.com/wall-{group_id}_{result['post_id']}"
     picture = "с картинкой" if attachment else "без картинки"
-    print(f"Пост опубликован во ВКонтакте ({picture}): {link}")
+    if scheduled_at:
+        print(f"Пост запланирован во ВКонтакте на {moscow_time(scheduled_at)} МСК ({picture}): {link}")
+    else:
+        print(f"Пост опубликован во ВКонтакте ({picture}): {link}")
 
 
 def check_access() -> None:
@@ -218,10 +246,19 @@ def parse_args() -> argparse.Namespace:
     post = commands.add_parser("post", help="опубликовать пост на стене сообщества")
     post.add_argument("--text", type=Path, required=True)
     post.add_argument("--image", type=Path, default=None, help="без него уйдёт только текст")
+    post.add_argument(
+        "--delay-minutes",
+        type=int,
+        default=0,
+        help="отложить публикацию на столько минут (отложенная запись ВК)",
+    )
     post.add_argument("--dry-run", action="store_true")
 
     commands.add_parser("check", help="проверить ключ, ничего не публикуя")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.command == "post" and args.delay_minutes < 0:
+        parser.error("--delay-minutes не может быть отрицательным")
+    return args
 
 
 def main() -> int:
@@ -229,7 +266,7 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "post":
-            send_post(args.text, args.image, args.dry_run)
+            send_post(args.text, args.image, args.delay_minutes, args.dry_run)
         else:
             check_access()
     except (VkError, ConfigError, FileNotFoundError) as error:

@@ -1,8 +1,9 @@
 # astro-channel
 
 Каждое утро в 9:00 по Москве облачная рутина Claude пишет пост
-«Астропогода» с карточкой и отправляет его в Telegram-канал, а затем
-тот же текст в группу ВКонтакте.
+«Астропогода» с карточкой и отправляет его в Telegram-канал. В группу
+ВКонтакте сразу уходит шутливый гороскоп для всех знаков, а через час
+там же выходит астропогода (отложенной записью).
 
 ## Как устроено
 
@@ -26,7 +27,7 @@
 | `CHANNEL_FOOTER` | нет | подпись внизу карточки, например `@my_channel` |
 | `VK_GROUP_TOKEN` | нет | ключ доступа сообщества ВК с доступом к стене; без него ВК пропускается |
 | `VK_GROUP_ID` | нет | числовой id группы без минуса; без него берётся из ключа |
-| `VK_BOT_LINK` | нет | ссылка в конце поста ВК, по умолчанию `https://t.me/tarologapp_bot?start=vk` |
+| `VK_BOT_LINK` | нет | ссылка в конце поста ВК; если не задана, ссылки нет |
 
 Чтобы бот мог писать в личку о сбоях, сначала напиши ему `/start`.
 
@@ -39,6 +40,8 @@ python scripts/card.py --headline "Луна в Тельце" --subline "Завт
 python scripts/send.py post --text out/post.md --image out/card.png --dry-run
 python scripts/vk.py check
 python scripts/vk.py post --text out/post.md --image out/card.png --dry-run
+python scripts/vk.py post --text out/horoscope.md --dry-run
+python scripts/vk.py post --text out/post.md --delay-minutes 60 --dry-run
 ```
 
 `vk.py check` ничего не публикует: проверяет ключ и пишет, разрешает ли ВК
